@@ -1,0 +1,5 @@
+hibachi-xyz>=0.2.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+certifi>=2024.8.30
+websockets>=12.0
