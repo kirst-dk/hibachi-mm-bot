@@ -9,3 +9,4 @@ logs/
 *.bak
 .DS_Store
 .idea/
+*.zip

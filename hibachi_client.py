@@ -124,25 +124,77 @@ class HibachiRest:
         log.error(f"Contract {symbol} not found. Available: {available}")
         return None
 
-    def get_positions(self) -> List[Dict[str, Any]]:
-        """Get all positions - uses get_inventory"""
+    def get_symbols(self) -> List[str]:
+        """Get all tradeable symbol strings from inventory"""
         try:
-            if hasattr(self.client, 'get_inventory'):
-                result = self.client.get_inventory()
-                if not result:
-                    return []
-                inventory = self._convert_to_dict(result)
-                positions = inventory.get('positions', [])
-                if isinstance(positions, list):
-                    return [self._convert_to_dict(p) for p in positions]
-                return []
-
-            account = self.get_account_info()
-            positions = account.get('positions', [])
-            if isinstance(positions, list):
-                return [self._convert_to_dict(p) for p in positions]
+            result = self.client.get_inventory()
+            symbols = []
+            for market in (getattr(result, 'markets', None) or []):
+                contract = getattr(market, 'contract', None)
+                if contract:
+                    sym = str(getattr(contract, 'symbol', ''))
+                    if sym and '/' in sym:
+                        symbols.append(sym)
+            return symbols
+        except Exception as e:
+            log.debug("get_symbols failed: %s", e)
             return []
 
+    def get_symbols_with_prices(self) -> Dict[str, Optional[float]]:
+        """Get all symbols with their current mark prices in one inventory call."""
+        try:
+            result = self.client.get_inventory()
+            out: Dict[str, Optional[float]] = {}
+            for market in (getattr(result, 'markets', None) or []):
+                contract = getattr(market, 'contract', None)
+                if not contract:
+                    continue
+                sym = str(getattr(contract, 'symbol', ''))
+                if not sym or '/' not in sym:
+                    continue
+                info = getattr(market, 'info', None)
+                price = None
+                if info:
+                    for field in ('markPrice', 'priceLatest', 'price24hAgo'):
+                        raw = getattr(info, field, None)
+                        if raw:
+                            try:
+                                price = float(raw)
+                                break
+                            except (TypeError, ValueError):
+                                pass
+                out[sym] = price
+            return out
+        except Exception as e:
+            log.debug("get_symbols_with_prices failed: %s", e)
+            return {}
+
+    def get_positions(self) -> List[Dict[str, Any]]:
+        """Get all open positions from account info"""
+        try:
+            result = self.client.get_account_info()
+            raw_positions = getattr(result, 'positions', []) or []
+            out = []
+            for p in raw_positions:
+                qty = float(getattr(p, 'quantity', 0) or 0)
+                direction = str(getattr(p, 'direction', 'Long'))
+                # Signed size: positive = Long, negative = Short
+                size = qty if direction.lower() == 'long' else -qty
+                upnl = (float(getattr(p, 'unrealizedTradingPnl', 0) or 0) +
+                        float(getattr(p, 'unrealizedFundingPnl', 0) or 0))
+                out.append({
+                    'symbol':               str(getattr(p, 'symbol', '')),
+                    'size':                 size,
+                    'quantity':             size,
+                    'direction':            direction,
+                    'entryPrice':           float(getattr(p, 'openPrice', 0) or 0),
+                    'markPrice':            float(getattr(p, 'markPrice', 0) or 0),
+                    'notionalValue':        float(getattr(p, 'notionalValue', 0) or 0),
+                    'unrealizedPnl':        upnl,
+                    'unrealizedTradingPnl': float(getattr(p, 'unrealizedTradingPnl', 0) or 0),
+                    'unrealizedFundingPnl': float(getattr(p, 'unrealizedFundingPnl', 0) or 0),
+                })
+            return [pos for pos in out if pos['size'] != 0]
         except Exception as e:
             log.debug("No positions found: %s", e)
             return []
@@ -482,3 +534,43 @@ class HibachiRest:
         except Exception as e:
             log.debug("Failed to get order details for %s: %s", order_id, e)
             return None
+
+    def close_position(self, symbol: str, size: float) -> Dict[str, Any]:
+        """Close an open position with a market order in the opposite direction.
+
+        Args:
+            symbol: Trading pair, e.g. 'BTC/USDT-P'
+            size:   Current position size (positive = long, negative = short)
+
+        Returns:
+            Order result dict with 'orderId' key.
+        """
+        if size == 0:
+            return {"status": "noop", "message": "Position size is zero"}
+
+        close_side = Side.SELL if size > 0 else Side.BUY
+        qty = abs(size)
+
+        # Attempt with ReduceOnly flag first; fall back without it if SDK
+        # does not support order_flags for market orders.
+        kwargs: Dict[str, Any] = dict(
+            symbol=symbol,
+            side=close_side,
+            quantity=qty,
+            max_fees_percent=0.01,
+        )
+        try:
+            from hibachi_xyz.types import OrderFlags as _OF
+            kwargs["order_flags"] = _OF.ReduceOnly
+            result = self.client.place_market_order(**kwargs)
+        except TypeError:
+            log.debug("place_market_order does not accept order_flags; retrying without")
+            kwargs.pop("order_flags", None)
+            result = self.client.place_market_order(**kwargs)
+
+        if isinstance(result, tuple):
+            result = {"orderId": str(result[-1])} if len(result) >= 2 else {}
+
+        log.info("close_position %s: %s %.4f → %s",
+                 symbol, "SELL" if size > 0 else "BUY", qty, result)
+        return self._convert_to_dict(result)
